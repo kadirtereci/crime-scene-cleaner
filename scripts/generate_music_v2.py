@@ -3,7 +3,7 @@
 
 import wave, struct, math, random, os
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MUSIC = os.path.join(BASE, "assets", "music")
 RATE = 44100
 

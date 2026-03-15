@@ -6,7 +6,7 @@ import random
 import math
 import os
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STAINS = os.path.join(BASE, "assets", "stains")
 os.makedirs(STAINS, exist_ok=True)
 

@@ -5,7 +5,7 @@ from PIL import Image, ImageDraw
 import math
 import os
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS = os.path.join(BASE, "assets", "images")
 
 # Colors
