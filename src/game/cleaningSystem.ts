@@ -1,4 +1,5 @@
-import { Position, StainData, ToolType, ToolConfig, TOOLS, TOOL_STAIN_MAP, LevelModifiers } from './types';
+import { Position, StainData, ToolType, ToolConfig, TOOLS, TOOL_STAIN_MAP, LevelModifiers, CleanableObjectData } from './types';
+import { TOOL_BEHAVIORS, getToolSpeedMultiplier, getDynamicReach } from './toolBehaviors';
 
 /** Base cleaning rate per tick */
 const BASE_CLEAN_RATE = 0.025;
@@ -26,6 +27,7 @@ function getSpeedMultiplier(speed: number): number {
  * Process a cleaning tick – reduces dirtLevel of stains near tool position.
  * Only cleans stains that the active tool can handle.
  * Respects toughness & needsSpray modifiers.
+ * Now uses tool-specific speed multipliers from toolBehaviors (Feature 4).
  * Returns { stains, cleaned } where cleaned = number of stains cleaned this tick.
  */
 export function cleanTick(
@@ -36,8 +38,17 @@ export function cleanTick(
   opts?: { toolOverride?: ToolConfig; speedBonus?: number; comboBoost?: number }
 ): { stains: StainData[]; cleaned: number } {
   const tool = opts?.toolOverride ?? TOOLS[activeTool];
+  const behavior = TOOL_BEHAVIORS[activeTool];
   const allowedStains = TOOL_STAIN_MAP[activeTool];
-  const speedMultiplier = getSpeedMultiplier(speed);
+
+  // Use tool-specific speed multiplier
+  const speedMultiplier = getToolSpeedMultiplier(activeTool, speed);
+
+  // Dynamic reach for mop (expands with speed)
+  const effectiveReach = activeTool === 'mop'
+    ? getDynamicReach('mop', speed) + (tool.reach - TOOLS.mop.reach) // add upgrade bonus
+    : tool.reach;
+
   const speedBonus = opts?.speedBonus ?? 1;
   const comboBoost = opts?.comboBoost ?? 1;
   let cleaned = 0;
@@ -49,7 +60,7 @@ export function cleanTick(
     if (!allowedStains.includes(stain.type)) return stain;
 
     const dist = distance(toolPosition, stain.position);
-    if (dist < stain.radius + tool.reach) {
+    if (dist < stain.radius + effectiveReach) {
       // If stain needs spray pre-treatment and hasn't been sprayed yet
       if (stain.needsSpray && !stain.sprayed) {
         if (activeTool === 'spray') {
@@ -57,6 +68,15 @@ export function cleanTick(
           return { ...stain, sprayed: true };
         }
         // Other tools can't work on unsprayed stains
+        return stain;
+      }
+
+      // Feature 4: Spray in 'apply' mode marks stains with sprayApplied for auto-dissolve
+      if (behavior.mode === 'apply' && !stain.needsSpray) {
+        if (!stain.sprayApplied) {
+          return { ...stain, sprayApplied: true };
+        }
+        // If already applied, let auto-dissolve handle it
         return stain;
       }
 
@@ -71,6 +91,27 @@ export function cleanTick(
       return { ...stain, dirtLevel: newDirt };
     }
     return stain;
+  });
+
+  return { stains: updated, cleaned };
+}
+
+/**
+ * Feature 4: Auto-dissolve spray-applied stains.
+ * Runs every tick regardless of active tool.
+ */
+export function tickSprayDissolve(stains: StainData[]): { stains: StainData[]; cleaned: number } {
+  const dissolveRate = TOOL_BEHAVIORS.spray.dissolveRate ?? 0.015;
+  let cleaned = 0;
+
+  const updated = stains.map((stain) => {
+    if (!stain.sprayApplied || stain.dirtLevel <= 0.01) return stain;
+
+    const newDirt = Math.max(0, stain.dirtLevel - dissolveRate);
+    if (stain.dirtLevel > 0.01 && newDirt <= 0.01) {
+      cleaned++;
+    }
+    return { ...stain, dirtLevel: newDirt };
   });
 
   return { stains: updated, cleaned };
@@ -105,6 +146,88 @@ export function tickStainEffects(
 
     return updated;
   });
+}
+
+/**
+ * Feature 3: Clean object segments near tool position.
+ * Same mechanics as cleanTick but for object segments.
+ */
+export function cleanObjectTick(
+  objects: CleanableObjectData[],
+  toolPosition: Position,
+  activeTool: ToolType,
+  speed: number = 0,
+  opts?: { toolOverride?: ToolConfig; speedBonus?: number; comboBoost?: number }
+): { objects: CleanableObjectData[]; cleaned: number } {
+  const tool = opts?.toolOverride ?? TOOLS[activeTool];
+  const allowedStains = TOOL_STAIN_MAP[activeTool];
+  const speedMultiplier = getToolSpeedMultiplier(activeTool, speed);
+  const effectiveReach = activeTool === 'mop'
+    ? getDynamicReach('mop', speed) + (tool.reach - TOOLS.mop.reach)
+    : tool.reach;
+  const speedBonus = opts?.speedBonus ?? 1;
+  const comboBoost = opts?.comboBoost ?? 1;
+  let cleaned = 0;
+
+  const updated = objects.map((obj) => {
+    const updatedSegments = obj.segments.map((seg) => {
+      if (seg.dirtLevel <= 0.01) return seg;
+      if (!allowedStains.includes(seg.stainType)) return seg;
+
+      const segPos: Position = {
+        x: obj.position.x + seg.offsetX,
+        y: obj.position.y + seg.offsetY,
+      };
+      const dist = distance(toolPosition, segPos);
+      if (dist < seg.radius + effectiveReach) {
+        const toughness = obj.toughness ?? 1;
+        const rate = (BASE_CLEAN_RATE * tool.power * speedMultiplier * speedBonus * comboBoost) / toughness;
+        const newDirt = Math.max(0, seg.dirtLevel - rate);
+
+        if (seg.dirtLevel > 0.01 && newDirt <= 0.01) {
+          cleaned++;
+        }
+        return { ...seg, dirtLevel: newDirt };
+      }
+      return seg;
+    });
+
+    return { ...obj, segments: updatedSegments };
+  });
+
+  return { objects: updated, cleaned };
+}
+
+/**
+ * Feature 3: Calculate total progress including both stains and objects.
+ */
+export function calculateTotalProgress(stains: StainData[], objects?: CleanableObjectData[]): number {
+  const stainItems = stains.length;
+  const segmentItems = objects
+    ? objects.reduce((sum, o) => sum + o.segments.length, 0)
+    : 0;
+  const total = stainItems + segmentItems;
+  if (total === 0) return 1;
+
+  const stainDirt = stains.reduce((sum, s) => sum + s.dirtLevel, 0);
+  const segmentDirt = objects
+    ? objects.reduce((sum, o) => sum + o.segments.reduce((ss, seg) => ss + seg.dirtLevel, 0), 0)
+    : 0;
+
+  return 1 - (stainDirt + segmentDirt) / total;
+}
+
+/**
+ * Feature 3: Check if all stains AND all object segments are cleaned.
+ */
+export function isLevelCompleteWithObjects(stains: StainData[], objects?: CleanableObjectData[]): boolean {
+  const stainsClean = stains.every((s) => s.dirtLevel <= 0.01);
+  if (!objects || objects.length === 0) return stainsClean;
+
+  const objectsClean = objects.every((o) =>
+    o.segments.every((seg) => seg.dirtLevel <= 0.01)
+  );
+  return stainsClean && objectsClean;
 }
 
 /**

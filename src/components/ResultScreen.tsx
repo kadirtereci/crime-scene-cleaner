@@ -15,10 +15,11 @@ import Animated, {
   withSpring,
   withTiming,
 } from 'react-native-reanimated';
-import { LevelResult } from '../game/types';
+import { LevelResult, StainData, EnvironmentType } from '../game/types';
 import { calculateCoins } from '../game/upgradeSystem';
 import { Colors, Fonts } from '../theme';
 import ConfettiEffect from './effects/ConfettiEffect';
+import BeforeAfterReveal from './BeforeAfterReveal';
 
 const { width: W } = Dimensions.get('window');
 
@@ -30,6 +31,14 @@ interface ResultScreenProps {
   onNext: () => void;
   onMenu: () => void;
   onUpgrades?: () => void;
+  /** Feature 1: Before/After reveal data */
+  initialStains?: StainData[];
+  environment?: EnvironmentType;
+  screenWidth?: number;
+  screenHeight?: number;
+  stainsRemoved?: number;
+  /** Extra stat rows (e.g. clues found in story mode) */
+  extraStats?: { label: string; value: string; icon: string }[];
 }
 
 function AnimatedStar({ index, filled }: { index: number; filled: boolean }) {
@@ -107,6 +116,12 @@ export default function ResultScreen({
   onNext,
   onMenu,
   onUpgrades,
+  initialStains,
+  environment,
+  screenWidth,
+  screenHeight,
+  stainsRemoved,
+  extraStats,
 }: ResultScreenProps) {
   const won = result.completed;
   const coinsEarned = calculateCoins(result.score, result.stars);
@@ -141,6 +156,16 @@ export default function ResultScreen({
           </View>
         )}
 
+        {/* Feature 1: Before/After Reveal (only on win) */}
+        {won && initialStains && environment && screenWidth && screenHeight && (
+          <BeforeAfterReveal
+            initialStains={initialStains}
+            environment={environment}
+            screenWidth={screenWidth}
+            screenHeight={screenHeight}
+          />
+        )}
+
         {/* Stats */}
         <View style={styles.statsBox}>
           <View style={styles.statRow}>
@@ -153,8 +178,21 @@ export default function ResultScreen({
           </View>
           <View style={styles.statRow}>
             <Text style={styles.statLabel}>Max Combo</Text>
-            <Text style={styles.statValue}>×{result.maxCombo}</Text>
+            <Text style={styles.statValue}>x{result.maxCombo}</Text>
           </View>
+          {stainsRemoved !== undefined && (
+            <View style={styles.statRow}>
+              <Text style={styles.statLabel}>Stains Removed</Text>
+              <Text style={styles.statValue}>{stainsRemoved}</Text>
+            </View>
+          )}
+          {/* Extra stats from story mode */}
+          {extraStats && extraStats.map((stat, i) => (
+            <View key={i} style={styles.statRow}>
+              <Text style={styles.statLabel}>{stat.icon} {stat.label}</Text>
+              <Text style={[styles.statValue, { color: Colors.tertiary }]}>{stat.value}</Text>
+            </View>
+          ))}
           <View style={[styles.statRow, { borderTopWidth: 1, borderTopColor: Colors.bgCard, paddingTop: 8 }]}>
             <Text style={[styles.statLabel, { color: Colors.tertiary }]}>
               <Ionicons name="logo-usd" size={13} color={Colors.tertiary} /> Coins

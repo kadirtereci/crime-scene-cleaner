@@ -27,6 +27,8 @@ const stainImages: Record<StainType, ImageSourcePropType> = {
 interface StainProps {
   stain: StainData;
   isBeingScrubbed?: boolean;
+  /** Feature 2: highlight remaining dirt with yellow pulse */
+  isHighlighted?: boolean;
 }
 
 /** Per-type animation config derived from dirtLevel */
@@ -103,7 +105,7 @@ function getTypeAnimConfig(
 const SHARD_ANGLES = [0, Math.PI * 0.5, Math.PI, Math.PI * 1.5];
 const SHARD_ROTATIONS = [0.3, -0.5, 0.8, -0.2];
 
-export default function Stain({ stain, isBeingScrubbed = false }: StainProps) {
+export default function Stain({ stain, isBeingScrubbed = false, isHighlighted = false }: StainProps) {
   const animScaleX = useSharedValue(1);
   const animScaleY = useSharedValue(1);
   const animOpacity = useSharedValue(1);
@@ -114,6 +116,11 @@ export default function Stain({ stain, isBeingScrubbed = false }: StainProps) {
   const jitterX = useSharedValue(0);
   const jitterY = useSharedValue(0);
   const glowOpacity = useSharedValue(0);
+  // Feature 2: Highlight pulse
+  const highlightScale = useSharedValue(1);
+  const highlightOpacity = useSharedValue(0);
+  // Feature 4: Spray dissolve bubble
+  const sprayBubbleOpacity = useSharedValue(0);
   const prevDirtRef = useRef(stain.dirtLevel);
   const bloodSpreadDone = useRef(false);
 
@@ -192,6 +199,49 @@ export default function Stain({ stain, isBeingScrubbed = false }: StainProps) {
       glowOpacity.value = withTiming(0, { duration: 150 });
     }
   }, [isBeingScrubbed, stain.dirtLevel > 0.01]);
+
+  // Feature 2: Highlight pulse animation
+  useEffect(() => {
+    if (isHighlighted) {
+      highlightScale.value = withRepeat(
+        withSequence(
+          withTiming(1.15, { duration: 400, easing: Easing.inOut(Easing.ease) }),
+          withTiming(1.0, { duration: 400, easing: Easing.inOut(Easing.ease) })
+        ),
+        -1,
+        true
+      );
+      highlightOpacity.value = withTiming(0.8, { duration: 200 });
+    } else {
+      highlightScale.value = withTiming(1, { duration: 200 });
+      highlightOpacity.value = withTiming(0, { duration: 200 });
+    }
+  }, [isHighlighted]);
+
+  // Feature 4: Spray dissolve bubble effect
+  useEffect(() => {
+    if (stain.sprayApplied && stain.dirtLevel > 0.01) {
+      sprayBubbleOpacity.value = withRepeat(
+        withSequence(
+          withTiming(0.6, { duration: 300 }),
+          withTiming(0.3, { duration: 300 })
+        ),
+        -1,
+        true
+      );
+    } else {
+      sprayBubbleOpacity.value = withTiming(0, { duration: 150 });
+    }
+  }, [stain.sprayApplied, stain.dirtLevel > 0.01]);
+
+  const highlightRingStyle = useAnimatedStyle(() => ({
+    opacity: highlightOpacity.value,
+    transform: [{ scale: highlightScale.value }],
+  }));
+
+  const sprayBubbleStyle = useAnimatedStyle(() => ({
+    opacity: sprayBubbleOpacity.value,
+  }));
 
   const animStyle = useAnimatedStyle(() => ({
     transform: [
@@ -367,6 +417,43 @@ export default function Stain({ stain, isBeingScrubbed = false }: StainProps) {
         >
           <Text style={{ fontSize: 11, color: '#fff' }}>S</Text>
         </View>
+      )}
+
+      {/* Feature 2: Highlight glow ring */}
+      <Animated.View
+        style={[
+          {
+            position: 'absolute',
+            left: -8,
+            top: -8,
+            width: size + 16,
+            height: size + 16,
+            borderRadius: (size + 16) / 2,
+            borderWidth: 3,
+            borderColor: '#FFCF48',
+          },
+          highlightRingStyle,
+        ]}
+      />
+
+      {/* Feature 4: Spray dissolve bubbles */}
+      {stain.sprayApplied && stain.dirtLevel > 0.01 && (
+        <Animated.View
+          style={[
+            {
+              position: 'absolute',
+              left: size * 0.15,
+              top: size * 0.15,
+              width: size * 0.7,
+              height: size * 0.7,
+              borderRadius: size * 0.35,
+              borderWidth: 2,
+              borderColor: '#00D4FF',
+              borderStyle: 'dashed',
+            },
+            sprayBubbleStyle,
+          ]}
+        />
       )}
 
       {/* Toughness indicator (small bars for tough stains) */}

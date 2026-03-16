@@ -61,9 +61,9 @@ export default function MainMenu() {
 
   useFocusEffect(
     useCallback(() => {
-      SoundManager.playMusic('menu');
+      SoundManager.playAdaptiveMusic('menu');
       return () => {
-        SoundManager.stopMusic();
+        SoundManager.stopAdaptiveMusic();
       };
     }, [])
   );
@@ -189,7 +189,7 @@ export default function MainMenu() {
 
         {/* Buttons — stacked with clear breathing room */}
         <View style={styles.btnArea}>
-          {/* PLAY */}
+          {/* CLASSIC MODE */}
           <Animated.View style={[styles.playWrap, btnStyle]}>
             <Animated.View style={[styles.playGlow, glowStyle]} />
             <AnimatedButton
@@ -199,7 +199,21 @@ export default function MainMenu() {
             >
               <View style={styles.btnInner}>
                 <Ionicons name="play" size={26} color={Colors.bgDark} />
-                <Text style={styles.playText}>PLAY</Text>
+                <Text style={styles.playText}>CLASSIC</Text>
+              </View>
+            </AnimatedButton>
+          </Animated.View>
+
+          {/* STORY MODE */}
+          <Animated.View style={btnStyle}>
+            <AnimatedButton
+              variant="secondary"
+              onPress={() => router.push('/story')}
+              style={styles.storyBtn}
+            >
+              <View style={styles.btnInner}>
+                <Ionicons name="book" size={22} color="#fff" />
+                <Text style={styles.storyText}>STORY MODE</Text>
               </View>
             </AnimatedButton>
           </Animated.View>
@@ -344,6 +358,19 @@ const styles = StyleSheet.create({
     color: Colors.bgDark,
     fontSize: 22,
     letterSpacing: 4,
+  },
+  storyBtn: {
+    paddingHorizontal: 44,
+    paddingVertical: 14,
+    backgroundColor: Colors.secondary,
+    borderColor: Colors.secondaryDark,
+    marginTop: 10,
+  },
+  storyText: {
+    color: '#fff',
+    fontSize: 16,
+    letterSpacing: 2,
+    fontWeight: '800',
   },
   version: {
     color: Colors.textLight,

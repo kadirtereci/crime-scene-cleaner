@@ -25,7 +25,7 @@ for i in range(num_samples):
     samples.append(int(sample * 32767))
 
 # Write WAV
-out_path = os.path.join(os.path.dirname(__file__), "assets", "sounds", "reject.wav")
+out_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "sounds", "reject.wav")
 with open(out_path, "wb") as f:
     data_size = num_samples * 2
     f.write(b"RIFF")

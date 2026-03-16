@@ -1,14 +1,16 @@
 /**
- * SoundManager — singleton for SFX + music via expo-av
- * 
+ * SoundManager — singleton for SFX + adaptive multi-layer music via expo-av
+ *
  * Guarantees:
- * - Only ONE music track plays at a time (stop previous before starting next)
+ * - 4-layer adaptive music system (base, rhythm, tension, climax)
+ * - Layers play simultaneously, volumes adjusted by game state
+ * - Smooth volume transitions via lerp (no jarring cuts)
  * - SFX are debounced to prevent overlapping floods
- * - Each SFX has a cooldown to avoid cacophony
+ * - Backward compatible: playMusic() still works for simple cases
  */
 import { Audio, AVPlaybackSource } from 'expo-av';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { StainType } from '../game/types';
+import { StainType, MusicLayer, MusicIntensityState } from '../game/types';
 
 type SFXKey =
   | 'scrub'
@@ -24,16 +26,31 @@ type SFXKey =
 
 type MusicKey = 'menu' | 'apartment' | 'warehouse' | 'office';
 
+const MUSIC_LAYERS: MusicLayer[] = ['base', 'rhythm', 'tension', 'climax'];
+
 const PREFS_KEY = 'csc_audio_prefs';
 
 // ── State ────────────────────────────────
 let sfxSounds: Partial<Record<SFXKey, Audio.Sound>> = {};
-let musicSound: Audio.Sound | null = null;
-let currentMusicKey: MusicKey | null = null;
 let sfxEnabled = true;
 let musicEnabled = true;
 let policeLightsEnabled = true;
 let initialized = false;
+
+// ── Adaptive Music State ─────────────────
+let layers: Record<MusicLayer, Audio.Sound | null> = {
+  base: null, rhythm: null, tension: null, climax: null,
+};
+let layerVolumes: Record<MusicLayer, number> = {
+  base: 0, rhythm: 0, tension: 0, climax: 0,
+};
+let targetVolumes: Record<MusicLayer, number> = {
+  base: 0, rhythm: 0, tension: 0, climax: 0,
+};
+let currentMusicKey: MusicKey | null = null;
+let volumeSmoothInterval: ReturnType<typeof setInterval> | null = null;
+const MASTER_MUSIC_VOLUME = 0.35;
+const LERP_FACTOR = 0.15;
 
 // ── Debounce: minimum ms between same SFX ──
 const SFX_COOLDOWNS: Record<SFXKey, number> = {
@@ -81,6 +98,35 @@ const cleanSources: Record<StainType, AVPlaybackSource> = {
   furniture: require('../../assets/sounds/clean-furniture.wav'),
 };
 
+// Adaptive music stem sources (4 environments × 4 layers)
+const musicStemSources: Record<MusicKey, Record<MusicLayer, AVPlaybackSource>> = {
+  menu: {
+    base: require('../../assets/music/menu_base.wav'),
+    rhythm: require('../../assets/music/menu_rhythm.wav'),
+    tension: require('../../assets/music/menu_tension.wav'),
+    climax: require('../../assets/music/menu_climax.wav'),
+  },
+  apartment: {
+    base: require('../../assets/music/apartment_base.wav'),
+    rhythm: require('../../assets/music/apartment_rhythm.wav'),
+    tension: require('../../assets/music/apartment_tension.wav'),
+    climax: require('../../assets/music/apartment_climax.wav'),
+  },
+  warehouse: {
+    base: require('../../assets/music/warehouse_base.wav'),
+    rhythm: require('../../assets/music/warehouse_rhythm.wav'),
+    tension: require('../../assets/music/warehouse_tension.wav'),
+    climax: require('../../assets/music/warehouse_climax.wav'),
+  },
+  office: {
+    base: require('../../assets/music/office_base.wav'),
+    rhythm: require('../../assets/music/office_rhythm.wav'),
+    tension: require('../../assets/music/office_tension.wav'),
+    climax: require('../../assets/music/office_climax.wav'),
+  },
+};
+/* eslint-enable @typescript-eslint/no-require-imports */
+
 // Stain-type-specific sound instances & debounce
 const scrubSounds: Partial<Record<StainType, Audio.Sound>> = {};
 const cleanSounds: Partial<Record<StainType, Audio.Sound>> = {};
@@ -88,14 +134,6 @@ const lastScrubPlayed: Partial<Record<StainType, number>> = {};
 const lastCleanPlayed: Partial<Record<StainType, number>> = {};
 const SCRUB_COOLDOWN = 180;
 const CLEAN_COOLDOWN = 200;
-
-const musicSources: Record<MusicKey, AVPlaybackSource> = {
-  menu: require('../../assets/music/menu.wav'),
-  apartment: require('../../assets/music/apartment.wav'),
-  warehouse: require('../../assets/music/warehouse.wav'),
-  office: require('../../assets/music/office.wav'),
-};
-/* eslint-enable @typescript-eslint/no-require-imports */
 
 async function loadPrefs() {
   try {
@@ -118,6 +156,77 @@ async function savePrefs() {
   } catch {}
 }
 
+/** Compute target volumes from game intensity state */
+function computeTargetVolumes(state: MusicIntensityState): Record<MusicLayer, number> {
+  const { comboTier, timePercent, isRush, isCleaning } = state;
+
+  // Default: idle
+  let base = 0.4;
+  let rhythm = 0.0;
+  let tension = 0.0;
+  let climax = 0.0;
+
+  if (isRush && (comboTier === 'inferno')) {
+    // Inferno + rush: maximum intensity
+    base = 0.15; rhythm = 0.3; tension = 0.4; climax = 0.6;
+  } else if (isRush) {
+    // Rush mode
+    base = 0.2; rhythm = 0.4; tension = 0.5; climax = 0.5;
+  } else if (comboTier === 'blazing' || comboTier === 'inferno') {
+    // High combo
+    base = 0.25; rhythm = 0.5; tension = 0.3; climax = 0.3;
+  } else if (timePercent < 0.4) {
+    // Time running low
+    base = 0.3; rhythm = 0.35; tension = 0.4; climax = 0.0;
+  } else if (comboTier === 'hot') {
+    // Medium combo
+    base = 0.3; rhythm = 0.45; tension = 0.0; climax = 0.0;
+  } else if (isCleaning || comboTier === 'warm') {
+    // Actively cleaning
+    base = 0.35; rhythm = 0.3; tension = 0.0; climax = 0.0;
+  } else {
+    // Idle
+    base = 0.4; rhythm = 0.0; tension = 0.0; climax = 0.0;
+  }
+
+  return { base, rhythm, tension, climax };
+}
+
+/** Start the smooth volume interpolation interval */
+function startVolumeSmoother() {
+  if (volumeSmoothInterval) return;
+  volumeSmoothInterval = setInterval(async () => {
+    let changed = false;
+    for (const layer of MUSIC_LAYERS) {
+      const current = layerVolumes[layer];
+      const target = targetVolumes[layer];
+      if (Math.abs(current - target) > 0.005) {
+        const next = current + (target - current) * LERP_FACTOR;
+        layerVolumes[layer] = next;
+        changed = true;
+        try {
+          await layers[layer]?.setVolumeAsync(next * MASTER_MUSIC_VOLUME);
+        } catch {}
+      } else if (current !== target) {
+        layerVolumes[layer] = target;
+        try {
+          await layers[layer]?.setVolumeAsync(target * MASTER_MUSIC_VOLUME);
+        } catch {}
+      }
+    }
+    if (!changed) {
+      // All volumes settled — keep interval running but skip work
+    }
+  }, 100);
+}
+
+function stopVolumeSmoother() {
+  if (volumeSmoothInterval) {
+    clearInterval(volumeSmoothInterval);
+    volumeSmoothInterval = null;
+  }
+}
+
 export const SoundManager = {
   async init() {
     if (initialized) return;
@@ -129,14 +238,11 @@ export const SoundManager = {
     initialized = true;
   },
 
-  /**
-   * Play a sound effect with debounce protection.
-   * Won't replay the same SFX until its cooldown has passed.
-   */
+  // ── SFX ────────────────────────────────────
+
   async playSFX(key: SFXKey) {
     if (!sfxEnabled) return;
 
-    // Debounce check
     const now = Date.now();
     const cooldown = SFX_COOLDOWNS[key] ?? 100;
     const last = lastPlayed[key] ?? 0;
@@ -149,10 +255,7 @@ export const SoundManager = {
     try {
       if (sfxSounds[key]) {
         const status = await sfxSounds[key]!.getStatusAsync();
-        if (status.isLoaded && status.isPlaying) {
-          // Already playing — skip to avoid overlap
-          return;
-        }
+        if (status.isLoaded && status.isPlaying) return;
         await sfxSounds[key]!.setPositionAsync(0);
         await sfxSounds[key]!.playAsync();
       } else {
@@ -163,10 +266,6 @@ export const SoundManager = {
     } catch {}
   },
 
-  /**
-   * Play stain-type-specific scrub sound (while actively cleaning).
-   * Falls back to generic 'scrub' if type-specific sound fails.
-   */
   async playScrubSFX(stainType: StainType) {
     if (!sfxEnabled) return;
 
@@ -194,10 +293,6 @@ export const SoundManager = {
     }
   },
 
-  /**
-   * Play stain-type-specific completion sound (when a stain is fully cleaned).
-   * Falls back to generic 'stainClean' if type-specific sound fails.
-   */
   async playCleanSFX(stainType: StainType) {
     if (!sfxEnabled) return;
 
@@ -231,7 +326,6 @@ export const SoundManager = {
     } catch {}
   },
 
-  /** Stop ALL currently playing SFX */
   async stopAllSFX() {
     const keys = Object.keys(sfxSounds) as SFXKey[];
     for (const key of keys) {
@@ -247,70 +341,136 @@ export const SoundManager = {
     }
   },
 
+  // ── Adaptive Music System ──────────────────
+
   /**
-   * Play a music track. Automatically stops any currently playing music first.
-   * Only one music track plays at any time.
-   * If the same track is already playing, does nothing.
+   * Load and start 4 music layers simultaneously for the given environment.
+   * All layers loop and play in sync; volumes are controlled independently.
    */
-  async playMusic(track: MusicKey) {
+  async playAdaptiveMusic(environment: MusicKey) {
     if (!musicEnabled) return;
 
-    // Same track already playing — skip
-    if (currentMusicKey === track && musicSound) {
+    // Same environment already playing — skip
+    if (currentMusicKey === environment && layers.base) {
       try {
-        const status = await musicSound.getStatusAsync();
+        const status = await layers.base.getStatusAsync();
         if (status.isLoaded && status.isPlaying) return;
       } catch {}
     }
 
-    // Stop whatever is playing first
-    await this.stopMusic();
+    // Stop any existing music
+    await this.stopAdaptiveMusic();
 
-    const source = musicSources[track];
-    if (!source) return;
+    const sources = musicStemSources[environment];
+    if (!sources) return;
+
+    // Set initial target volumes (idle state — only base audible)
+    targetVolumes = { base: 0.4, rhythm: 0.0, tension: 0.0, climax: 0.0 };
+    layerVolumes = { base: 0.4, rhythm: 0.0, tension: 0.0, climax: 0.0 };
 
     try {
-      const { sound } = await Audio.Sound.createAsync(source, {
-        isLooping: true,
-        volume: 0.3,
+      // Load all 4 layers
+      const loadPromises = MUSIC_LAYERS.map(async (layer) => {
+        const { sound } = await Audio.Sound.createAsync(sources[layer], {
+          isLooping: true,
+          volume: layerVolumes[layer] * MASTER_MUSIC_VOLUME,
+        });
+        layers[layer] = sound;
       });
-      musicSound = sound;
-      currentMusicKey = track;
-      await sound.playAsync();
-    } catch {}
-  },
+      await Promise.all(loadPromises);
 
-  /** Stop and unload current music track */
-  async stopMusic() {
-    try {
-      if (musicSound) {
-        const s = musicSound;
-        musicSound = null;
-        currentMusicKey = null;
-        await s.stopAsync();
-        await s.unloadAsync();
-      }
+      currentMusicKey = environment;
+
+      // Start all layers simultaneously
+      const playPromises = MUSIC_LAYERS.map(async (layer) => {
+        await layers[layer]?.playAsync();
+      });
+      await Promise.all(playPromises);
+
+      // Start volume smoothing
+      startVolumeSmoother();
     } catch {
-      musicSound = null;
-      currentMusicKey = null;
+      // Cleanup on failure
+      await this.stopAdaptiveMusic();
     }
   },
 
-  async pauseMusic() {
-    try {
-      await musicSound?.pauseAsync();
-    } catch {}
+  /**
+   * Update music intensity based on current game state.
+   * Call this periodically (every ~200ms) from the game loop.
+   */
+  updateMusicIntensity(state: MusicIntensityState) {
+    if (!currentMusicKey) return;
+    targetVolumes = computeTargetVolumes(state);
   },
 
-  async resumeMusic() {
+  /** Stop and unload all music layers */
+  async stopAdaptiveMusic() {
+    stopVolumeSmoother();
+    const stopPromises = MUSIC_LAYERS.map(async (layer) => {
+      try {
+        if (layers[layer]) {
+          const s = layers[layer]!;
+          layers[layer] = null;
+          await s.stopAsync();
+          await s.unloadAsync();
+        }
+      } catch {
+        layers[layer] = null;
+      }
+    });
+    await Promise.all(stopPromises);
+    currentMusicKey = null;
+    layerVolumes = { base: 0, rhythm: 0, tension: 0, climax: 0 };
+    targetVolumes = { base: 0, rhythm: 0, tension: 0, climax: 0 };
+  },
+
+  /** Pause all music layers (keeps position) */
+  async pauseAdaptiveMusic() {
+    stopVolumeSmoother();
+    for (const layer of MUSIC_LAYERS) {
+      try {
+        await layers[layer]?.pauseAsync();
+      } catch {}
+    }
+  },
+
+  /** Resume all music layers from where they paused */
+  async resumeAdaptiveMusic() {
     if (!musicEnabled) return;
-    try {
-      await musicSound?.playAsync();
-    } catch {}
+    for (const layer of MUSIC_LAYERS) {
+      try {
+        await layers[layer]?.playAsync();
+      } catch {}
+    }
+    startVolumeSmoother();
   },
 
-  /** Which music track is currently active */
+  // ── Backward Compatible Wrappers ───────────
+
+  /** @deprecated Use playAdaptiveMusic instead */
+  async playMusic(track: MusicKey) {
+    await this.playAdaptiveMusic(track);
+  },
+
+  /** @deprecated Use stopAdaptiveMusic instead */
+  async stopMusic() {
+    await this.stopAdaptiveMusic();
+  },
+
+  /** @deprecated Use pauseAdaptiveMusic instead */
+  async pauseMusic() {
+    await this.pauseAdaptiveMusic();
+  },
+
+  /** @deprecated Use resumeAdaptiveMusic instead */
+  async resumeMusic() {
+    await this.resumeAdaptiveMusic();
+  },
+
   getCurrentMusic: () => currentMusicKey,
+
+  // ── Settings ───────────────────────────────
 
   isSFXEnabled: () => sfxEnabled,
   isMusicEnabled: () => musicEnabled,
@@ -324,7 +484,7 @@ export const SoundManager = {
 
   async setMusicEnabled(enabled: boolean) {
     musicEnabled = enabled;
-    if (!enabled) await this.stopMusic();
+    if (!enabled) await this.stopAdaptiveMusic();
     await savePrefs();
   },
 

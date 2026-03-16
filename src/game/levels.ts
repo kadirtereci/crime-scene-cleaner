@@ -4,6 +4,9 @@ import {
   StainType,
   ToolType,
   EnvironmentType,
+  CleanableObjectData,
+  ObjectType,
+  ObjectSegment,
 } from './types';
 
 const MX = 40; // margin X
@@ -39,6 +42,20 @@ export function resolveStains(stains: StainData[], screenWidth: number, screenHe
     position: {
       x: MX + stain.position.x * (screenWidth - 2 * MX),
       y: MT + stain.position.y * (screenHeight - MT - MB),
+    },
+  }));
+}
+
+/**
+ * Resolve ratio-based object positions to pixel coordinates for the current screen size.
+ */
+export function resolveObjects(objects: CleanableObjectData[] | undefined, screenWidth: number, screenHeight: number): CleanableObjectData[] {
+  if (!objects) return [];
+  return objects.map((obj) => ({
+    ...obj,
+    position: {
+      x: MX + obj.position.x * (screenWidth - 2 * MX),
+      y: MT + obj.position.y * (screenHeight - MT - MB),
     },
   }));
 }
@@ -152,6 +169,20 @@ export const ALL_LEVELS: LevelConfig[] = [
       s('6c', 'furniture', 0.25, 0.6, 42, { toughness: 1.5 }),
       s('6d', 'blood', 0.5, 0.55, 36),
       s('6e', 'blood', 0.65, 0.4, 38),
+    ],
+    objects: [
+      {
+        id: 'obj6a',
+        type: 'sofa' as ObjectType,
+        position: { x: 0.7, y: 0.7 },
+        width: 120,
+        height: 60,
+        toughness: 1.5,
+        segments: [
+          { id: 'obj6a-s1', offsetX: -30, offsetY: 0, radius: 18, dirtLevel: 1, stainType: 'furniture' as StainType },
+          { id: 'obj6a-s2', offsetX: 30, offsetY: 0, radius: 18, dirtLevel: 1, stainType: 'blood' as StainType },
+        ],
+      },
     ],
   },
   {
@@ -309,6 +340,21 @@ export const ALL_LEVELS: LevelConfig[] = [
       s('14f', 'trash', 0.6, 0.55, 38, { toughness: 1.3 }),
       s('14g', 'furniture', 0.4, 0.6, 48, { toughness: 2.2 }),
       s('14h', 'furniture', 0.3, 0.75, 46, { toughness: 2.0 }),
+    ],
+    objects: [
+      {
+        id: 'obj14a',
+        type: 'table' as ObjectType,
+        position: { x: 0.5, y: 0.45 },
+        width: 90,
+        height: 70,
+        toughness: 2.0,
+        segments: [
+          { id: 'obj14a-s1', offsetX: -20, offsetY: -15, radius: 16, dirtLevel: 1, stainType: 'glass' as StainType },
+          { id: 'obj14a-s2', offsetX: 20, offsetY: -15, radius: 16, dirtLevel: 1, stainType: 'blood' as StainType },
+          { id: 'obj14a-s3', offsetX: 0, offsetY: 15, radius: 18, dirtLevel: 1, stainType: 'trash' as StainType },
+        ],
+      },
     ],
   },
   {

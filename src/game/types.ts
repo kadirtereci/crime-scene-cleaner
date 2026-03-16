@@ -35,6 +35,30 @@ export interface StainData {
   regrowRate?: number;
   /** stain spreads to increase radius over time (px per second, 0 = no spread) */
   spreadRate?: number;
+  /** spray has been applied for auto-dissolve (Feature 4: tool feel) */
+  sprayApplied?: boolean;
+}
+
+// ── Object Cleaning types (Feature 3) ──────────────────────
+export type ObjectType = 'sofa' | 'carpet' | 'table' | 'wallSection';
+
+export interface ObjectSegment {
+  id: string;
+  offsetX: number;  // relative to object center
+  offsetY: number;  // relative to object center
+  radius: number;
+  dirtLevel: number;  // 0-1
+  stainType: StainType;  // reuses TOOL_STAIN_MAP for compatibility
+}
+
+export interface CleanableObjectData {
+  id: string;
+  type: ObjectType;
+  position: Position;
+  width: number;
+  height: number;
+  segments: ObjectSegment[];
+  toughness?: number;
 }
 
 // ── Tool types ──────────────────────────────────────────────
@@ -93,6 +117,8 @@ export interface LevelConfig {
   name: string;
   environment: EnvironmentType;
   stains: StainData[];
+  /** cleanable objects with segments (Feature 3) */
+  objects?: CleanableObjectData[];
   /** available tools for this level */
   tools: ToolType[];
   /** time limit in seconds */
@@ -111,6 +137,17 @@ export const STAIN_COLORS: Record<StainType, string[]> = {
   evidence: ['#FFD700', '#FFA500', '#FFCF48'],
   furniture: ['#DEB887', '#D2691E', '#BC8F5F'],
 };
+
+// ── Adaptive Music Types ────────────────────────────────────
+export type MusicLayer = 'base' | 'rhythm' | 'tension' | 'climax';
+
+export interface MusicIntensityState {
+  comboTier: 'none' | 'warm' | 'hot' | 'blazing' | 'inferno';
+  timePercent: number;    // 0-1 (remaining time / total time)
+  isRush: boolean;
+  isCleaning: boolean;
+  progress: number;       // 0-1 cleaning progress
+}
 
 // ── Score & Game State ──────────────────────────────────────
 export type GameState = 'playing' | 'paused' | 'won' | 'lost';

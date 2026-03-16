@@ -11,6 +11,7 @@ import Animated, {
   Easing,
 } from 'react-native-reanimated';
 import { ToolType, TOOLS } from '../game/types';
+import { TOOL_BEHAVIORS } from '../game/toolBehaviors';
 import { ComboTier } from '../game/comboSystem';
 import { getTier, getTierColor } from '../game/tierSystem';
 import { Colors } from '../theme';

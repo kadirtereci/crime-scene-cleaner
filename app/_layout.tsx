@@ -125,6 +125,10 @@ export default function RootLayout() {
         <Stack.Screen name="upgrades" options={{ gestureEnabled: true }} />
         <Stack.Screen name="settings" options={{ gestureEnabled: true, animation: 'slide_from_bottom' }} />
         <Stack.Screen name="game/[id]" options={{ gestureEnabled: false }} />
+        <Stack.Screen name="story/index" options={{ gestureEnabled: true }} />
+        <Stack.Screen name="story/[episodeId]" options={{ gestureEnabled: true }} />
+        <Stack.Screen name="story/game/[id]" options={{ gestureEnabled: false }} />
+        <Stack.Screen name="story/evidence/[episodeId]" options={{ gestureEnabled: true }} />
       </Stack>
       <StatusBar style="light" />
     </View>

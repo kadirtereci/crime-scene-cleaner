@@ -26,6 +26,7 @@ import ComboDisplay from '../components/ComboDisplay';
 import ResultScreen from '../components/ResultScreen';
 import PauseMenu from '../components/PauseMenu';
 import TutorialOverlay from '../components/TutorialOverlay';
+import CleanableObject from '../components/CleanableObject';
 import SparkleEffect from '../components/effects/SparkleEffect';
 import CleaningParticles from '../components/effects/CleaningParticles';
 import CleanTrail from '../components/effects/CleanTrail';
@@ -33,6 +34,7 @@ import RejectFlash from '../components/effects/RejectFlash';
 import ProgressPop from '../components/effects/ProgressPop';
 import ComboScreenEffect from '../components/effects/ComboScreenEffect';
 import ComboTierAnnouncement from '../components/effects/ComboTierAnnouncement';
+import RepairProgress from '../components/effects/RepairProgress';
 
 import {
   StainData,
@@ -43,20 +45,24 @@ import {
   EnvironmentType,
   Position,
   PlayerProgress,
+  CleanableObjectData,
   TOOLS,
   TOOL_STAIN_MAP,
 } from '../game/types';
 import {
   cleanTick,
+  tickSprayDissolve,
+  cleanObjectTick,
   tickStainEffects,
-  calculateProgress,
-  isLevelComplete,
+  calculateTotalProgress,
+  isLevelCompleteWithObjects,
   calculateStars,
   distance,
 } from '../game/cleaningSystem';
+import { TOOL_BEHAVIORS, getDynamicReach } from '../game/toolBehaviors';
 import { ComboState, createComboState, onStainCleaned, tickCombo, getComboTier, comboCleanBoost, ComboTier } from '../game/comboSystem';
 import { ScoreState, createScoreState, addStainScore, addTimeBonus } from '../game/scoreSystem';
-import { ALL_LEVELS, getLevel, resolveStains } from '../game/levels';
+import { ALL_LEVELS, getLevel, resolveStains, resolveObjects } from '../game/levels';
 import { loadProgress, saveResult } from '../game/progressStorage';
 import { getEffectiveTool, getSpeedBonus } from '../game/upgradeSystem';
 import { useTutorial } from '../tutorial/useTutorial';
@@ -93,9 +99,18 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
     [levelConfig.stains, W, H]
   );
 
+  // Feature 3: Resolve object positions
+  const resolvedObjects = useMemo(
+    () => resolveObjects(levelConfig.objects, W, H),
+    [levelConfig.objects, W, H]
+  );
+
   // ── state ──────────────────────────────
   const [stains, setStains] = useState<StainData[]>(() =>
     resolvedStains.map((s) => ({ ...s }))
+  );
+  const [objects, setObjects] = useState<CleanableObjectData[]>(() =>
+    resolvedObjects.map((o) => ({ ...o, segments: o.segments.map((seg) => ({ ...seg })) }))
   );
   const [progress, setProgress] = useState(0);
   const [timeLeft, setTimeLeft] = useState(levelConfig.timeLimit);
@@ -111,7 +126,9 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
   >([]);
   const [trailPoints, setTrailPoints] = useState<{ x: number; y: number; timestamp: number }[]>([]);
   const [scrubbedStainIds, setScrubbedStainIds] = useState<Set<string>>(new Set());
+  const [scrubbedSegmentIds, setScrubbedSegmentIds] = useState<Set<string>>(new Set());
   const [showBriefing, setShowBriefing] = useState(!!levelConfig.modifiers?.briefing);
+  const [showResult, setShowResult] = useState(false);
   const [playerProgress, setPlayerProgress] = useState<PlayerProgress | null>(null);
   const [tierAnnouncement, setTierAnnouncement] = useState<{ id: number; tier: ComboTier } | null>(null);
   const tierAnnouncementId = useRef(0);
@@ -122,6 +139,24 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
   const [progressPops, setProgressPops] = useState<
     { id: number; pos: Position; text: string }[]
   >([]);
+
+  // Feature 2: Highlight remaining dirt
+  const [highlightActive, setHighlightActive] = useState(false);
+  const [highlightCooldown, setHighlightCooldown] = useState(0);
+  const highlightTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cooldownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Feature 4: Repair kit hold state
+  const [repairHold, setRepairHold] = useState<{
+    targetStainId: string | null;
+    startTime: number;
+    progress: number;
+    position: Position;
+  }>({ targetStainId: null, startTime: 0, progress: 0, position: { x: 0, y: 0 } });
+
+  // Feature 1: Before/After — store initial stains snapshot
+  const initialStainsRef = useRef<StainData[]>(resolvedStains.map((s) => ({ ...s })));
+
   let sparkleId = useRef(0);
   const particleId = useRef(0);
   const cleanTickCount = useRef(0);
@@ -134,6 +169,8 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
 
   const stainRef = useRef(stains);
   stainRef.current = stains;
+  const objectsRef = useRef(objects);
+  objectsRef.current = objects;
   const comboRef = useRef(combo);
   comboRef.current = combo;
   const scoreRef = useRef(score);
@@ -166,9 +203,9 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
   // ── analytics & music for environment ──
   useEffect(() => {
     Analytics.track('level_start', { levelId: currentLevelId, environment: levelConfig.environment });
-    SoundManager.playMusic(levelConfig.environment as 'apartment' | 'warehouse' | 'office');
+    SoundManager.playAdaptiveMusic(levelConfig.environment as 'apartment' | 'warehouse' | 'office');
     return () => {
-      SoundManager.stopMusic();
+      SoundManager.stopAdaptiveMusic();
     };
   }, [levelConfig.environment]);
 
@@ -206,7 +243,7 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
       const updated = tickStainEffects(stainRef.current, mods);
       setStains(updated);
       stainRef.current = updated;
-      setProgress(calculateProgress(updated));
+      setProgress(calculateTotalProgress(updated, objectsRef.current));
     }, 1000);
 
     return () => clearInterval(id);
@@ -227,16 +264,64 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
     return () => clearInterval(id);
   }, [gameState]);
 
+  // ── music intensity driver ──────────
+  useEffect(() => {
+    if (gameState !== 'playing') return;
+
+    const interval = setInterval(() => {
+      const timePercent = timeLeft / levelConfig.timeLimit;
+      const rushSec = levelConfig.modifiers?.rushLastSeconds ?? 0;
+      const isRush = rushSec > 0 && timeLeft <= rushSec;
+
+      SoundManager.updateMusicIntensity({
+        comboTier: getComboTier(comboRef.current.count),
+        timePercent,
+        isRush,
+        isCleaning: scrubbedStainIds.size > 0 || scrubbedSegmentIds.size > 0,
+        progress,
+      });
+    }, 200);
+
+    return () => clearInterval(interval);
+  }, [gameState, timeLeft, progress, scrubbedStainIds.size, scrubbedSegmentIds.size]);
+
+  // Feature 2: Highlight cooldown ticker
+  useEffect(() => {
+    if (highlightCooldown <= 0) return;
+    cooldownIntervalRef.current = setInterval(() => {
+      setHighlightCooldown((c) => {
+        if (c <= 1) {
+          if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+          return 0;
+        }
+        return c - 1;
+      });
+    }, 1000);
+    return () => {
+      if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+    };
+  }, [highlightCooldown > 0]);
+
+  // Feature 2: Activate highlight
+  const activateHighlight = useCallback(() => {
+    if (highlightCooldown > 0 || highlightActive || gameState !== 'playing') return;
+    setHighlightActive(true);
+    highlightTimerRef.current = setTimeout(() => {
+      setHighlightActive(false);
+      setHighlightCooldown(10);
+    }, 3000);
+  }, [highlightCooldown, highlightActive, gameState]);
+
   // ── pause / resume ─────────────────────
   const togglePause = useCallback(() => {
     setGameState((s) => {
       if (s === 'playing') {
         stopCleaning();
-        SoundManager.pauseMusic();
+        SoundManager.pauseAdaptiveMusic();
         return 'paused';
       }
       if (s === 'paused') {
-        SoundManager.resumeMusic();
+        SoundManager.resumeAdaptiveMusic();
         return 'playing';
       }
       return s;
@@ -269,6 +354,9 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
 
       setResult(levelResult);
       setGameState(won ? 'won' : 'lost');
+
+      // Delay showing result screen for dramatic effect
+      setTimeout(() => setShowResult(true), 1200);
 
       try {
         await saveResult(levelResult);
@@ -318,6 +406,57 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
     setProgressPops((prev) => prev.filter((p) => p.id !== id));
   }, []);
 
+  // ── combo/score helper on cleaned stains ──
+  const handleCleaned = useCallback((cleaned: number, updatedStains: StainData[], prevStains: StainData[]) => {
+    if (cleaned <= 0) return;
+
+    const now = Date.now();
+    let newCombo = comboRef.current;
+    let newScore = scoreRef.current;
+
+    for (let i = 0; i < updatedStains.length; i++) {
+      if (prevStains[i]?.dirtLevel > 0.01 && updatedStains[i].dirtLevel <= 0.01) {
+        addSparkle(updatedStains[i].position);
+      }
+    }
+
+    for (let i = 0; i < cleaned; i++) {
+      newCombo = onStainCleaned(newCombo, now);
+      newScore = addStainScore(newScore, newCombo.multiplier);
+    }
+    setCombo(newCombo);
+    comboRef.current = newCombo;
+    setScore(newScore);
+    scoreRef.current = newScore;
+
+    // Haptics scale with combo tier
+    const currentTier = getComboTier(newCombo.count);
+    if (currentTier === 'blazing' || currentTier === 'inferno') {
+      HapticManager.heavy();
+    } else if (currentTier === 'hot') {
+      HapticManager.medium();
+    } else {
+      HapticManager.light();
+    }
+
+    // Tier transition announcement
+    if (currentTier !== lastTierRef.current && currentTier !== 'none') {
+      lastTierRef.current = currentTier;
+      const tid = tierAnnouncementId.current++;
+      setTierAnnouncement({ id: tid, tier: currentTier });
+      SoundManager.playSFX('comboUp');
+      HapticManager.warning();
+    }
+
+    // Play type-specific clean sound for completed stains
+    for (let i = 0; i < updatedStains.length; i++) {
+      if (prevStains[i]?.dirtLevel > 0.01 && updatedStains[i].dirtLevel <= 0.01) {
+        SoundManager.playCleanSFX(updatedStains[i].type);
+        break;
+      }
+    }
+  }, [addSparkle]);
+
   // ── cleaning loop ──────────────────────
   const cleaningInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -342,18 +481,95 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
 
         const prevStains = stainRef.current;
         const toolPos = { x: mopX.value, y: mopY.value };
-        const { stains: updated, cleaned } = cleanTick(
-          prevStains,
-          toolPos,
-          activeTool,
-          speedRef.current,
-          { toolOverride: effectiveTool, speedBonus, comboBoost: comboCleanBoost(comboRef.current.count) }
-        );
+        const behavior = TOOL_BEHAVIORS[activeTool];
+
+        // Feature 4: Tool-specific behavior branches
+        let updated = prevStains;
+        let cleaned = 0;
+
+        if (behavior.mode === 'hold') {
+          // ── Repair Kit: hold-to-repair ──
+          // Find nearest furniture stain in range
+          const allowedStains = TOOL_STAIN_MAP[activeTool];
+          const holdDuration = behavior.holdDuration ?? 1500;
+          let closestStain: StainData | null = null;
+          let closestDist = Infinity;
+
+          for (const s of prevStains) {
+            if (s.dirtLevel <= 0.01 || !allowedStains.includes(s.type)) continue;
+            const d = distance(toolPos, s.position);
+            if (d < s.radius + effectiveTool.reach && d < closestDist) {
+              closestDist = d;
+              closestStain = s;
+            }
+          }
+
+          if (closestStain) {
+            setRepairHold((prev) => {
+              if (prev.targetStainId === closestStain!.id) {
+                // Continue holding
+                const elapsed = Date.now() - prev.startTime;
+                const prog = Math.min(1, elapsed / holdDuration);
+
+                if (prog >= 1) {
+                  // Complete! Set dirtLevel to 0
+                  updated = prevStains.map((s) =>
+                    s.id === closestStain!.id ? { ...s, dirtLevel: 0 } : s
+                  );
+                  cleaned = 1;
+                  return { targetStainId: null, startTime: 0, progress: 0, position: { x: 0, y: 0 } };
+                }
+                return { ...prev, progress: prog, position: closestStain!.position };
+              }
+              // Start new hold
+              return { targetStainId: closestStain!.id, startTime: Date.now(), progress: 0, position: closestStain!.position };
+            });
+          } else {
+            // No stain in range — cancel hold
+            setRepairHold({ targetStainId: null, startTime: 0, progress: 0, position: { x: 0, y: 0 } });
+          }
+        } else {
+          // ── Swipe / Apply mode: standard cleaning ──
+          setRepairHold({ targetStainId: null, startTime: 0, progress: 0, position: { x: 0, y: 0 } });
+          const result = cleanTick(
+            prevStains,
+            toolPos,
+            activeTool,
+            speedRef.current,
+            { toolOverride: effectiveTool, speedBonus, comboBoost: comboCleanBoost(comboRef.current.count) }
+          );
+          updated = result.stains;
+          cleaned = result.cleaned;
+        }
+
+        // Feature 4: Always run spray dissolve pass
+        const sprayResult = tickSprayDissolve(updated);
+        updated = sprayResult.stains;
+        cleaned += sprayResult.cleaned;
+
         setStains(updated);
         stainRef.current = updated;
 
+        // Feature 3: Clean objects
+        let objCleaned = 0;
+        if (objectsRef.current.length > 0 && behavior.mode !== 'hold') {
+          const objResult = cleanObjectTick(
+            objectsRef.current,
+            toolPos,
+            activeTool,
+            speedRef.current,
+            { toolOverride: effectiveTool, speedBonus, comboBoost: comboCleanBoost(comboRef.current.count) }
+          );
+          setObjects(objResult.objects);
+          objectsRef.current = objResult.objects;
+          objCleaned = objResult.cleaned;
+        }
+
         // Track which stains are in range (for scrub jitter)
-        const toolReach = effectiveTool.reach;
+        // Use dynamic reach for mop
+        const toolReach = activeTool === 'mop'
+          ? getDynamicReach('mop', speedRef.current) + (effectiveTool.reach - TOOLS.mop.reach)
+          : effectiveTool.reach;
         const allowedStains = TOOL_STAIN_MAP[activeTool];
         const inRange = new Set<string>();
         for (const s of updated) {
@@ -366,6 +582,21 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
           }
         }
         setScrubbedStainIds(inRange);
+
+        // Track scrubbed object segments
+        if (objectsRef.current.length > 0) {
+          const segInRange = new Set<string>();
+          for (const obj of objectsRef.current) {
+            for (const seg of obj.segments) {
+              if (seg.dirtLevel <= 0.01 || !allowedStains.includes(seg.stainType)) continue;
+              const segPos = { x: obj.position.x + seg.offsetX, y: obj.position.y + seg.offsetY };
+              if (distance(toolPos, segPos) < seg.radius + toolReach) {
+                segInRange.add(seg.id);
+              }
+            }
+          }
+          setScrubbedSegmentIds(segInRange);
+        }
 
         // Play scrub SFX while actively cleaning (type-specific)
         if (inRange.size > 0) {
@@ -414,7 +645,7 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
         for (let i = 0; i < updated.length; i++) {
           const prev = prevStains[i];
           const curr = updated[i];
-          if (prev.dirtLevel <= curr.dirtLevel) continue;
+          if (!prev || prev.dirtLevel <= curr.dirtLevel) continue;
 
           if (!milestonesHitRef.current[curr.id]) {
             milestonesHitRef.current[curr.id] = new Set();
@@ -455,59 +686,14 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
           });
         }
 
-        // Sparkle + combo + score on clean
-        if (cleaned > 0) {
-          const now = Date.now();
-          let newCombo = comboRef.current;
-          let newScore = scoreRef.current;
+        // Sparkle + combo + score on clean (stains + object segments)
+        const totalCleaned = cleaned + objCleaned;
+        handleCleaned(totalCleaned, updated, prevStains);
 
-          for (let i = 0; i < updated.length; i++) {
-            if (prevStains[i].dirtLevel > 0.01 && updated[i].dirtLevel <= 0.01) {
-              addSparkle(updated[i].position);
-            }
-          }
-
-          for (let i = 0; i < cleaned; i++) {
-            newCombo = onStainCleaned(newCombo, now);
-            newScore = addStainScore(newScore, newCombo.multiplier);
-          }
-          setCombo(newCombo);
-          comboRef.current = newCombo;
-          setScore(newScore);
-          scoreRef.current = newScore;
-
-          // Haptics scale with combo tier
-          const currentTier = getComboTier(newCombo.count);
-          if (currentTier === 'blazing' || currentTier === 'inferno') {
-            HapticManager.heavy();
-          } else if (currentTier === 'hot') {
-            HapticManager.medium();
-          } else {
-            HapticManager.light();
-          }
-
-          // Tier transition announcement
-          if (currentTier !== lastTierRef.current && currentTier !== 'none') {
-            lastTierRef.current = currentTier;
-            const tid = tierAnnouncementId.current++;
-            setTierAnnouncement({ id: tid, tier: currentTier });
-            SoundManager.playSFX('comboUp');
-            HapticManager.warning();
-          }
-
-          // Play type-specific clean sound for completed stains
-          for (let i = 0; i < updated.length; i++) {
-            if (prevStains[i].dirtLevel > 0.01 && updated[i].dirtLevel <= 0.01) {
-              SoundManager.playCleanSFX(updated[i].type);
-              break; // one clean sound per tick is enough
-            }
-          }
-        }
-
-        const prog = calculateProgress(updated);
+        const prog = calculateTotalProgress(updated, objectsRef.current);
         setProgress(prog);
 
-        if (isLevelComplete(updated)) {
+        if (isLevelCompleteWithObjects(updated, objectsRef.current)) {
           stopCleaning();
           setTimeLeft((t) => {
             handleGameEnd(true, t);
@@ -516,7 +702,7 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
         }
       }, 33);
     },
-    [activeTool, handleGameEnd, tutorial.isActive]
+    [activeTool, handleGameEnd, tutorial.isActive, handleCleaned]
   );
 
   const moveCleaning = useCallback((x: number, y: number) => {
@@ -541,6 +727,15 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
     mopX.value = x;
     mopY.value = y;
 
+    // Feature 4: Cancel repair hold if finger moves too far
+    if (TOOL_BEHAVIORS[activeTool].mode === 'hold' && repairHold.targetStainId) {
+      const holdPos = repairHold.position;
+      const moveDist = Math.sqrt((x - holdPos.x) ** 2 + (y - holdPos.y) ** 2);
+      if (moveDist > effectiveTool.reach + 20) {
+        setRepairHold({ targetStainId: null, startTime: 0, progress: 0, position: { x: 0, y: 0 } });
+      }
+    }
+
     // Add trail point (lightweight — max 8 points, 200ms lifetime)
     setTrailPoints((prev) => {
       const now = Date.now();
@@ -548,7 +743,7 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
       const next = [...filtered, { x, y, timestamp: now }];
       return next.length > 20 ? next.slice(next.length - 20) : next;
     });
-  }, []);
+  }, [activeTool, repairHold.targetStainId, repairHold.position]);
 
   const stopCleaning = useCallback(() => {
     setMopVisible(false);
@@ -556,6 +751,8 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
     speedRef.current = 0;
     setTrailPoints([]);
     setScrubbedStainIds(new Set());
+    setScrubbedSegmentIds(new Set());
+    setRepairHold({ targetStainId: null, startTime: 0, progress: 0, position: { x: 0, y: 0 } });
     if (cleaningInterval.current) {
       clearInterval(cleaningInterval.current);
       cleaningInterval.current = null;
@@ -578,6 +775,7 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
   // ── actions ────────────────────────────
   const restart = useCallback(() => {
     setStains(resolvedStains.map((s) => ({ ...s })));
+    setObjects(resolvedObjects.map((o) => ({ ...o, segments: o.segments.map((seg) => ({ ...seg })) })));
     setProgress(0);
     setTimeLeft(levelConfig.timeLimit);
     setGameState('playing');
@@ -585,12 +783,14 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
     setCombo(createComboState());
     setScore(createScoreState());
     // Resume music — it may be paused (from pause menu) or stopped (from game end)
-    SoundManager.playMusic(levelConfig.environment as 'apartment' | 'warehouse' | 'office');
+    SoundManager.playAdaptiveMusic(levelConfig.environment as 'apartment' | 'warehouse' | 'office');
     setResult(null);
+    setShowResult(false);
     setSparkles([]);
     setCleaningParticles([]);
     setTrailPoints([]);
     setScrubbedStainIds(new Set());
+    setScrubbedSegmentIds(new Set());
     setRejectFlashes([]);
     setProgressPops([]);
     lastRejectRef.current = {};
@@ -599,7 +799,15 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
     setTierAnnouncement(null);
     setActiveTool(levelConfig.tools[0]);
     setShowBriefing(!!levelConfig.modifiers?.briefing);
-  }, [levelConfig, resolvedStains]);
+    // Feature 2: Reset highlight
+    setHighlightActive(false);
+    setHighlightCooldown(0);
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    // Feature 4: Reset repair hold
+    setRepairHold({ targetStainId: null, startTime: 0, progress: 0, position: { x: 0, y: 0 } });
+    // Feature 1: Reset initial stains snapshot
+    initialStainsRef.current = resolvedStains.map((s) => ({ ...s }));
+  }, [levelConfig, resolvedStains, resolvedObjects]);
 
   const goNext = useCallback(() => {
     // Go back to levels, then push next game — keeps stack clean
@@ -622,6 +830,11 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
 
   const hasNextLevel = currentLevelId < ALL_LEVELS.length;
 
+  // Count stains removed for Feature 1
+  const stainsRemoved = useMemo(() => {
+    return stains.filter((s) => s.dirtLevel <= 0.01).length;
+  }, [result ? stains : null]);
+
   // ── render ─────────────────────────────
   return (
     <GestureHandlerRootView style={styles.root}>
@@ -634,6 +847,29 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
               <Ionicons name="flash" size={12} color={Colors.tertiary} />
               <Text style={styles.scoreText}>{score.score}</Text>
             </View>
+            {/* Feature 2: Highlight dirt button */}
+            <TouchableOpacity
+              style={[
+                styles.highlightBtn,
+                highlightActive && styles.highlightBtnActive,
+                highlightCooldown > 0 && styles.highlightBtnCooldown,
+              ]}
+              onPress={activateHighlight}
+              disabled={highlightCooldown > 0 || highlightActive}
+              accessible
+              accessibilityRole="button"
+              accessibilityLabel={highlightCooldown > 0 ? `Highlight cooldown ${highlightCooldown}s` : 'Highlight remaining dirt'}
+            >
+              {highlightCooldown > 0 ? (
+                <Text style={styles.cooldownText}>{highlightCooldown}</Text>
+              ) : (
+                <Ionicons
+                  name="eye"
+                  size={16}
+                  color={highlightActive ? Colors.bgDark : Colors.textPrimary}
+                />
+              )}
+            </TouchableOpacity>
             <TouchableOpacity style={styles.pauseBtn} onPress={togglePause} accessible accessibilityRole="button" accessibilityLabel="Pause game">
               <Ionicons name="pause" size={16} color={Colors.textPrimary} />
             </TouchableOpacity>
@@ -660,8 +896,22 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
               <View style={styles.floorOverlay} />
             )}
 
+            {/* Feature 3: Cleanable objects */}
+            {objects.map((obj) => (
+              <CleanableObject
+                key={obj.id}
+                object={obj}
+                scrubbedSegmentIds={scrubbedSegmentIds}
+              />
+            ))}
+
             {stains.map((s) => (
-              <Stain key={s.id} stain={s} isBeingScrubbed={scrubbedStainIds.has(s.id)} />
+              <Stain
+                key={s.id}
+                stain={s}
+                isBeingScrubbed={scrubbedStainIds.has(s.id)}
+                isHighlighted={highlightActive && s.dirtLevel > 0.01}
+              />
             ))}
 
             {/* Clean trail */}
@@ -706,7 +956,24 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
               />
             ))}
 
-            <Mop x={mopX} y={mopY} angle={mopAngle} visible={mopVisible} tool={activeTool} isCleaning={scrubbedStainIds.size > 0} comboTier={comboTier} reachOverride={effectiveTool.reach} totalLevel={upgrades ? upgrades.power + upgrades.reach + upgrades.speed : 0} />
+            {/* Feature 4: Repair progress indicator */}
+            <RepairProgress
+              position={repairHold.position}
+              progress={repairHold.progress}
+              visible={repairHold.targetStainId !== null}
+            />
+
+            <Mop
+              x={mopX}
+              y={mopY}
+              angle={mopAngle}
+              visible={mopVisible}
+              tool={activeTool}
+              isCleaning={scrubbedStainIds.size > 0 || scrubbedSegmentIds.size > 0}
+              comboTier={comboTier}
+              reachOverride={activeTool === 'mop' ? getDynamicReach('mop', speedRef.current) + (effectiveTool.reach - TOOLS.mop.reach) : effectiveTool.reach}
+              totalLevel={upgrades ? upgrades.power + upgrades.reach + upgrades.speed : 0}
+            />
 
             {/* Darkness overlay */}
             {(levelConfig.modifiers?.darkness ?? 0) > 0 && (
@@ -731,6 +998,7 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
         active={activeTool}
         onSelect={(t) => {
           setActiveTool(t);
+          setRepairHold({ targetStainId: null, startTime: 0, progress: 0, position: { x: 0, y: 0 } });
           SoundManager.playSFX('toolSwitch');
         }}
         toolUpgrades={playerProgress?.toolUpgrades}
@@ -791,7 +1059,7 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
       )}
 
       {/* Result */}
-      {(gameState === 'won' || gameState === 'lost') && result && (
+      {showResult && result && (
         <ResultScreen
           result={result}
           levelName={levelConfig.name}
@@ -800,6 +1068,11 @@ export default function GameScreen({ levelId: propLevelId }: GameScreenProps) {
           onNext={goNext}
           onMenu={goMenu}
           onUpgrades={() => router.push('/upgrades')}
+          initialStains={initialStainsRef.current}
+          environment={levelConfig.environment}
+          screenWidth={W}
+          screenHeight={H}
+          stainsRemoved={stainsRemoved}
         />
       )}
     </GestureHandlerRootView>
@@ -857,6 +1130,26 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.bgElevated,
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  highlightBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: Colors.bgElevated,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  highlightBtnActive: {
+    backgroundColor: Colors.tertiary,
+  },
+  highlightBtnCooldown: {
+    opacity: 0.5,
+  },
+  cooldownText: {
+    fontFamily: Fonts.bodyBold,
+    color: Colors.textSecondary,
+    fontSize: 12,
+    fontVariant: ['tabular-nums'],
   },
   gameArea: {
     flex: 1,
